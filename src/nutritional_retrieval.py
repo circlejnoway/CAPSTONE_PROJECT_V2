@@ -1,99 +1,83 @@
 """
 nutrition_retrieval.py
 ----------------------
-Retrieve nutritional information for products listed on a receipt.
+Multi‑source nutritional retrieval pipeline for receipt items.
 
-Uses:
-- Open Food Facts API (primary source, filtered for Qatar)
-- OpenAI as a fallback when no product is found
-- Abbreviation expansion & fuzzy matching to handle receipt shorthand
+Free sources used (in order):
+    1. USDA FoodData Central
+    2. Open Food Facts
+    3. API Ninjas (nutrition endpoint)
+    4. Google Gemini (free LLM)
+    5. Ollama (optional, local, unlimited)
 """
 
 import json
 import logging
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-import openai
 import requests
+import openai  # kept for compatibility but not used unless OPENAI_API_KEY is set
 from rapidfuzz import fuzz, process
-
-# openfoodfacts Python package (you already have it installed)
-import openfoodfacts
-
-# Load environment variables (e.g., OPENAI_API_KEY)
 from dotenv import load_dotenv
+import openfoodfacts
 
 load_dotenv()
 
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
-OPENFOODFACTS_COUNTRY = "qatar"           # "world" for global search
-SEARCH_PAGE_SIZE = 5                      # how many results to fuzzy-match against
-MIN_FUZZY_SCORE = 75                      # minimum similarity to accept a match
-
-# If you don't have an OpenAI key, the fallback will be skipped.
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+MIN_FUZZY_SCORE = 75
+SEARCH_PAGE_SIZE = 5
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
+# API keys from environment
+USDA_API_KEY = os.getenv("USDA_API_KEY", "")
+NINJAS_API_KEY = os.getenv("NINJAS_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# Optional: Ollama is local, no key needed
 
 # ----------------------------------------------------------------------
-# Abbreviation Handling and Expansion
+# Abbreviation handling
 # ----------------------------------------------------------------------
 def load_abbreviations(filepath: str = "data/abbreviations.json") -> Dict[str, str]:
-    """Load abbreviations JSON; supports flat dict or nested under 'abbr_map'."""
-    import os
     if not os.path.exists(filepath):
         logging.warning(f"Abbreviations file not found at {filepath}. Using empty mapping.")
         return {}
-
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
+        with open(filepath, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
-
-        # If the file is a flat dictionary already, use it directly
-        if isinstance(data, dict) and "abbr_map" not in data:
-            return data
-
-        # If wrapped inside "abbr_map", extract that
-        if isinstance(data, dict) and "abbr_map" in data and isinstance(data["abbr_map"], dict):
+        if isinstance(data, dict) and "abbr_map" in data:
             return data["abbr_map"]
+        elif isinstance(data, dict):
+            return data
+        else:
+            logging.warning("Unexpected format – using empty mapping")
+            return {}
+    except Exception as e:
+        logging.warning(f"Error loading abbreviations: {e}")
+        return {}
 
-        logging.warning("Abbreviations file is not in the expected format. Returning empty mapping.")
-        return {}
-    except json.JSONDecodeError as e:
-        logging.warning(f"Invalid JSON in {filepath}: {e}. Using empty mapping.")
-        return {}
-    
 def expand_abbreviations(text: str, mapping: Dict[str, str]) -> str:
     lowered = text.lower().strip()
-    # Try whole phrase first
     if lowered in mapping:
         return mapping[lowered]
-    # Then word-by-word fallback
     words = lowered.split()
     expanded = [mapping.get(w, w) for w in words]
     return " ".join(expanded)
 
-
 # ----------------------------------------------------------------------
-# Receipt Line Parsing
+# Receipt line parsing
 # ----------------------------------------------------------------------
-# Regex to extract quantity and unit.
-# Supports: kg, g, l, ml, litre, liter, oz, lb, piece(s), pcs.
 QTY_PATTERN = re.compile(
     r"(\d+(?:\.\d+)?)\s*(kg|g|l|ml|litre|liter|oz|lb|piece|pcs|pc)\b",
     re.IGNORECASE,
 )
 
-# Unit normalisation map (to g or ml for easier scaling, if needed)
 UNIT_NORMALIZE = {
-    "kg": ("kg", 1000),   # we keep kg but note conversion if we want grams
+    "kg": ("kg", 1000),
     "g": "g",
     "l": "l",
     "ml": "ml",
@@ -106,30 +90,13 @@ UNIT_NORMALIZE = {
     "pc": "piece",
 }
 
-
 def parse_receipt_line(line: str) -> Dict[str, Optional[str]]:
-    """
-    Extract product name, quantity, and unit from a single receipt line.
-
-    Returns:
-        {
-            "raw": ...,
-            "product": str,       # cleaned product name
-            "quantity": float | None,
-            "unit": str | None
-        }
-    """
     line = line.strip()
-    # Remove common price patterns (e.g., "@ 25.00", "25.00")
-    # Keep only the part before any price indication.
-    # A simple approach: split on " @ " and take the first part, or remove trailing numbers.
     product_part = line
     if " @ " in product_part:
         product_part = product_part.split(" @ ")[0]
-    # Remove trailing currency amounts
     product_part = re.sub(r"\s+\d+\.?\d*\s*$", "", product_part)
 
-    # Find quantity/unit in the product part
     qty_match = QTY_PATTERN.search(product_part)
     quantity = None
     unit = None
@@ -141,16 +108,13 @@ def parse_receipt_line(line: str) -> Dict[str, Optional[str]]:
         quantity = float(qty_str)
         unit_info = UNIT_NORMALIZE.get(unit_raw, unit_raw)
         if isinstance(unit_info, tuple):
-            unit = unit_info[0]  # "kg"
+            unit = unit_info[0]
         else:
             unit = unit_info
-        # Remove the quantity part from product name
         product_name = product_part[: qty_match.start()] + product_part[qty_match.end() :]
         product_name = re.sub(r"\s+", " ", product_name).strip()
 
-    # Remove leftover noise like double spaces, trailing punctuation
     product_name = re.sub(r"[^\w\s]", "", product_name).strip()
-
     return {
         "raw": line,
         "product": product_name,
@@ -158,220 +122,385 @@ def parse_receipt_line(line: str) -> Dict[str, Optional[str]]:
         "unit": unit,
     }
 
+# ----------------------------------------------------------------------
+# Helper: add context to ambiguous food queries
+# ----------------------------------------------------------------------
+def add_food_context(product_name: str) -> str:
+    """Append words like 'raw' or 'fresh' to improve API accuracy for generic items."""
+    # Simple heuristics – can be expanded
+    ambiguous_words = {
+        "tom": "fresh tomato",
+        "potato": "raw potato",
+        "chicken breast": "chicken breast raw",
+        "rice": "white rice raw",
+        "bread": "whole wheat bread",
+    }
+    lowered = product_name.lower().strip()
+    if lowered in ambiguous_words:
+        return ambiguous_words[lowered]
+    # If the name is very short, add " raw" or " generic"
+    if len(lowered.split()) == 1 and len(lowered) <= 4:
+        return f"{lowered} raw"
+    return product_name
 
 # ----------------------------------------------------------------------
-# Nutritional Lookup using Open Food Facts
+# Source 1: USDA FoodData Central
 # ----------------------------------------------------------------------
-def search_openfoodfacts(query: str, country: str = OPENFOODFACTS_COUNTRY) -> Optional[Dict]:
-    """
-    Search Open Food Facts by product name and return the first result
-    that contains nutritional information.
-    Works with openfoodfacts>=2.0,<3.0 (v5 in your case).
-    """
+USDA_BASE_URL = "https://api.nal.usda.gov/fdc/v1"
+
+def search_usda_food(query: str, page_size: int = 5) -> Optional[List[Dict]]:
+    if not USDA_API_KEY:
+        logging.info("USDA API key not set – skipping.")
+        return None
+
+    url = f"{USDA_BASE_URL}/foods/search"
+    params = {
+        "api_key": USDA_API_KEY,
+        "query": query,
+        "pageSize": page_size,
+        # USDA expects a comma‑separated string, NOT a list
+        "dataType": "Foundation,SR Legacy",   # removed Survey (FNDDS) to avoid special‑char issues
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("foods", [])
+    except Exception as e:
+        logging.error(f"USDA search error: {e}")
+        return None
+
+def get_usda_nutrition_per_100g(food_item: Dict) -> Optional[Dict]:
+    nutrients = {}
+    for fn in food_item.get("foodNutrients", []):
+        nid = fn.get("nutrientId")
+        value = fn.get("value")
+        if value is None:
+            continue
+        if nid == 1008:
+            nutrients["energy-kcal_100g"] = value
+        elif nid == 1003:
+            nutrients["proteins_100g"] = value
+        elif nid == 1004:
+            nutrients["fat_100g"] = value
+        elif nid == 1258:
+            nutrients["saturated-fat_100g"] = value
+        elif nid == 1005:
+            nutrients["carbohydrates_100g"] = value
+        elif nid == 2000:
+            nutrients["sugars_100g"] = value
+        elif nid == 1079:
+            nutrients["fiber_100g"] = value
+        elif nid == 1093:
+            salt_per_100g = (value * 2.5) / 1000
+            nutrients["salt_100g"] = round(salt_per_100g, 2)
+
+    if "energy-kcal_100g" in nutrients:
+        return nutrients
+    return None
+
+def get_nutrition_usda(product_name: str) -> Optional[Dict]:
+    # Enrich the query to get better matches for fresh foods
+    enriched = add_food_context(product_name)
+    foods = search_usda_food(enriched)
+    if not foods:
+        return None
+
+    # Fuzzy match on description
+    best, best_score = None, 0
+    for f in foods:
+        score = fuzz.token_sort_ratio(product_name.lower(), f.get("description", "").lower())
+        if score > best_score:
+            best_score = score
+            best = f
+    if best and best_score >= MIN_FUZZY_SCORE:
+        nutrients = get_usda_nutrition_per_100g(best)
+        if nutrients:
+            logging.info(f"✅ USDA: {best.get('description')} (score: {best_score})")
+            return nutrients
+    return None
+
+# ----------------------------------------------------------------------
+# Source 2: Open Food Facts
+# ----------------------------------------------------------------------
+def search_openfoodfacts(query: str) -> Optional[Dict]:
     try:
         api = openfoodfacts.API(user_agent="MyCapstone/1.0")
-        # Correct method for v2.x+ is product.text_search(query, ...)
-        # but in some versions it's product.search(query, ...)
-        # Let's try the correct parameter names for v5.x:
-        # The text_search method in v5 accepts: query, page, page_size, sort_by,
-        # and also "countries" (not "cc") as a filter. Actually, the parameter might be "countries".
-        # I'll catch TypeError to fallback.
+        # Try with country filter first
+        results = api.product.text_search(
+            query,
+            page_size=SEARCH_PAGE_SIZE,
+            cc="qatar",
+        )
+    except TypeError:
+        # Fallback without country filter (older or different OFF version)
         try:
-            results = api.product.text_search(
-                query,
-                page_size=SEARCH_PAGE_SIZE,
-                countries=country,          # <-- "countries" not "cc"
-            )
-        except TypeError:
-            # maybe older version, try without country filter
             results = api.product.text_search(query, page_size=SEARCH_PAGE_SIZE)
+        except Exception as e:
+            logging.error(f"OFF search error (fallback): {e}")
+            return None
     except Exception as e:
-        logging.error(f"Open Food Facts API error: {e}")
+        logging.error(f"OFF search error: {e}")
         return None
 
     if not results or "products" not in results:
         return None
-
-    for product in results["products"]:
-        if product.get("nutriments"):
+    for p in results["products"]:
+        if p.get("nutriments"):
             return {
-                "product_name": product.get("product_name", query),
-                "nutriments": product["nutriments"],
+                "product_name": p.get("product_name", query),
+                "nutriments": p["nutriments"],
             }
     return None
 
-
-def fuzzy_match_product(query: str, candidates: List[Dict]) -> Optional[Dict]:
-    """
-    Given a list of product dicts (from API), pick the one whose
-    product_name best matches the query using token_sort_ratio.
-    Returns the best match if score >= MIN_FUZZY_SCORE, else None.
-    """
-    if not candidates:
-        return None
-
-    names = [p.get("product_name", "") for p in candidates]
-    # Remove empty names
-    valid = [(p, n) for p, n in zip(candidates, names) if n]
-    if not valid:
-        return None
-
-    best_match = process.extractOne(
-        query,
-        [n for _, n in valid],
-        scorer=fuzz.token_sort_ratio,
-        score_cutoff=MIN_FUZZY_SCORE,
-    )
-    if best_match:
-        matched_name, score, idx = best_match
-        return valid[idx][0]
-    return None
-
-
 def get_nutrition_openfoodfacts(product_name: str) -> Optional[Dict]:
-    # First try a direct search
     result = search_openfoodfacts(product_name)
     if result:
+        logging.info(f"✅ OFF: {result['product_name']}")
         return result["nutriments"]
 
-    # If no direct hit, broader fuzzy match
+    # Broader fuzzy search
     api = openfoodfacts.API(user_agent="MyCapstone/1.0")
     try:
-        try:
-            broad_results = api.product.text_search(
-                product_name,
-                page_size=SEARCH_PAGE_SIZE * 2,
-                countries="world",           # <-- "countries"
-            )
-        except TypeError:
-            broad_results = api.product.text_search(product_name, page_size=SEARCH_PAGE_SIZE * 2)
+        broad = api.product.text_search(product_name, page_size=SEARCH_PAGE_SIZE*2, cc="world")
+    except TypeError:
+        broad = api.product.text_search(product_name, page_size=SEARCH_PAGE_SIZE*2)
     except Exception as e:
-        logging.error(f"Open Food Facts broad search error: {e}")
-        return None
-    # … rest of fuzzy matching remains the same
-
-
-# ----------------------------------------------------------------------
-# Fallback via OpenAI
-# ----------------------------------------------------------------------
-OPENAI_SYSTEM_PROMPT = (
-    "You are a nutritional database. For a given food product, return a JSON object "
-    "with typical nutritional values per 100 grams (or per 100 ml for liquids). "
-    "Include only these keys: energy-kcal_100g, fat_100g, saturated-fat_100g, "
-    "carbohydrates_100g, sugars_100g, fiber_100g, proteins_100g, salt_100g. "
-    "Use standard units. If the product is unknown, return an empty JSON object {}."
-)
-
-
-def get_nutrition_openai(product_name: str) -> Optional[Dict]:
-    """
-    Use OpenAI's ChatCompletion to generate nutritional data per 100g/ml.
-    Requires OPENAI_API_KEY to be set.
-    """
-    if not OPENAI_API_KEY:
-        logging.warning("OpenAI API key not set – skipping fallback.")
+        logging.error(f"OFF broad search error: {e}")
         return None
 
+    if not broad or "products" not in broad:
+        return None
+
+    best_sc, best_p = 0, None
+    for p in broad["products"]:
+        name = p.get("product_name", "")
+        sc = fuzz.token_sort_ratio(product_name.lower(), name.lower())
+        if sc > best_sc:
+            best_sc = sc
+            best_p = p
+    if best_p and best_sc >= MIN_FUZZY_SCORE and best_p.get("nutriments"):
+        logging.info(f"✅ OFF fuzzy: {best_p['product_name']} (score: {best_sc})")
+        return best_p["nutriments"]
+    return None
+
+# ----------------------------------------------------------------------
+# Source 3: API Ninjas (replaces CalorieNinjas)
+# ----------------------------------------------------------------------
+def get_nutrition_ninjas(product_name: str, quantity: Optional[float] = None, unit: Optional[str] = None) -> Optional[Dict]:
+    if not NINJAS_API_KEY:
+        logging.info("API Ninjas key not set – skipping.")
+        return None
+
+    query = product_name
+    if quantity and unit:
+        query = f"{quantity} {unit} {product_name}"
+
+    url = "https://api.api-ninjas.com/v1/nutrition"
+    headers = {"X-Api-Key": NINJAS_API_KEY}
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",  # or gpt-4
-            messages=[
-                {"role": "system", "content": OPENAI_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Product: {product_name}"},
-            ],
-            temperature=0.1,
-            max_tokens=200,
-        )
-        content = response.choices[0].message.content.strip()
-        # Parse the JSON; sometimes it’s inside a markdown code block
+        resp = requests.get(url, params={"query": query}, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logging.error(f"API Ninjas error: {e}")
+        return None
+
+    items = data if isinstance(data, list) else data.get("items", [])
+    if not items:
+        return None
+
+    item = items[0]
+    logging.info(f"✅ API Ninjas: {item.get('name', product_name)}")
+
+    # Determine total weight for scaling
+    total_weight_g = item.get("serving_size_g", 100)
+    if not isinstance(total_weight_g, (int, float)) or total_weight_g <= 0:
+        total_weight_g = 100
+    factor = 100.0 / total_weight_g
+
+    def safe_get(key: str, default: float = 0.0) -> float:
+        value = item.get(key, default)
+        if isinstance(value, str):
+            # Premium field – try to estimate
+            logging.debug(f"'{key}' is premium placeholder: '{value}'")
+            return default
+        return float(value) if value is not None else default
+
+    fat = safe_get("fat_total_g")
+    saturated_fat = safe_get("fat_saturated_g")
+    carbs = safe_get("carbohydrates_total_g")
+    fiber = safe_get("fiber_g")
+    sugar = safe_get("sugar_g")
+    sodium_mg = safe_get("sodium_mg")
+
+    calories = safe_get("calories")
+    protein = safe_get("protein_g")
+
+    # Estimate missing values from available macronutrients
+    if calories == 0.0 and (fat > 0 or carbs > 0 or protein > 0):
+        estimated_protein = 0.15 * (fat * 9 + carbs * 4) / 4 if protein == 0 else protein
+        calories = 9 * fat + 4 * carbs + 4 * estimated_protein
+        logging.debug(f"Calories estimated: {calories:.1f} kcal")
+    if protein == 0.0 and calories > 0:
+        # Assume 15% of calories from protein
+        protein = (calories * 0.15) / 4
+        logging.debug(f"Protein estimated: {protein:.1f} g")
+
+    nutrients = {
+        "energy-kcal_100g": calories * factor,
+        "fat_100g": fat * factor,
+        "saturated-fat_100g": saturated_fat * factor,
+        "carbohydrates_100g": carbs * factor,
+        "sugars_100g": sugar * factor,
+        "fiber_100g": fiber * factor,
+        "proteins_100g": protein * factor,
+        "salt_100g": (sodium_mg * 2.5 / 1000) * factor,
+    }
+    return nutrients
+
+# ----------------------------------------------------------------------
+# Source 4: Google Gemini (free LLM)
+# ----------------------------------------------------------------------
+def get_nutrition_gemini(product_name: str) -> Optional[Dict]:
+    if not GEMINI_API_KEY:
+        logging.info("Gemini API key not set – skipping.")
+        return None
+
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+
+    prompt = (
+        "You are a nutritional database. For the following food product, return a JSON object "
+        "with typical nutritional values per 100 grams (or per 100 ml for liquids). "
+        "Include only these keys (all numeric): energy-kcal_100g, fat_100g, saturated-fat_100g, "
+        "carbohydrates_100g, sugars_100g, fiber_100g, proteins_100g, salt_100g. "
+        "If the product is unknown, return an empty JSON object {}."
+    )
+    try:
+        model = genai.GenerativeModel("gemini-2.0-flash")
+        response = model.generate_content(f"{prompt}\n\nProduct: {product_name}")
+        content = response.text.strip()
         json_match = re.search(r"\{.*\}", content, re.DOTALL)
         if json_match:
             data = json.loads(json_match.group(0))
-            # Rename keys to match Open Food Facts style (for consistency)
             return {
-                "energy-kcal_100g": data.get("energy-kcal_100g"),
-                "fat_100g": data.get("fat_100g"),
-                "saturated-fat_100g": data.get("saturated-fat_100g"),
-                "carbohydrates_100g": data.get("carbohydrates_100g"),
-                "sugars_100g": data.get("sugars_100g"),
-                "fiber_100g": data.get("fiber_100g"),
-                "proteins_100g": data.get("proteins_100g"),
-                "salt_100g": data.get("salt_100g"),
+                "energy-kcal_100g": data.get("energy-kcal_100g", 0),
+                "fat_100g": data.get("fat_100g", 0),
+                "saturated-fat_100g": data.get("saturated-fat_100g", 0),
+                "carbohydrates_100g": data.get("carbohydrates_100g", 0),
+                "sugars_100g": data.get("sugars_100g", 0),
+                "fiber_100g": data.get("fiber_100g", 0),
+                "proteins_100g": data.get("proteins_100g", 0),
+                "salt_100g": data.get("salt_100g", 0),
             }
         else:
-            logging.warning(f"OpenAI response not valid JSON: {content}")
+            logging.warning(f"Gemini response not valid JSON: {content}")
     except Exception as e:
-        logging.error(f"OpenAI fallback error: {e}")
+        logging.error(f"Gemini API error: {e}")
     return None
 
+# ----------------------------------------------------------------------
+# Source 5: Ollama (local, optional)
+# ----------------------------------------------------------------------
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
+
+def get_nutrition_ollama(product_name: str, model: str = "llama3.2") -> Optional[Dict]:
+    if not OLLAMA_AVAILABLE:
+        return None
+    prompt = (
+        "You are a nutritional database. Return a JSON object with per 100g values: "
+        "energy-kcal_100g, fat_100g, saturated-fat_100g, carbohydrates_100g, "
+        "sugars_100g, fiber_100g, proteins_100g, salt_100g.\n"
+        f"Product: {product_name}"
+    )
+    try:
+        response = ollama.chat(model=model, messages=[{"role": "user", "content": prompt}])
+        content = response["message"]["content"]
+        json_match = re.search(r"\{.*\}", content, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group(0))
+            return {
+                "energy-kcal_100g": data.get("energy-kcal_100g", 0),
+                "fat_100g": data.get("fat_100g", 0),
+                "saturated-fat_100g": data.get("saturated-fat_100g", 0),
+                "carbohydrates_100g": data.get("carbohydrates_100g", 0),
+                "sugars_100g": data.get("sugars_100g", 0),
+                "fiber_100g": data.get("fiber_100g", 0),
+                "proteins_100g": data.get("proteins_100g", 0),
+                "salt_100g": data.get("salt_100g", 0),
+            }
+    except Exception as e:
+        logging.error(f"Ollama error: {e}")
+    return None
 
 # ----------------------------------------------------------------------
-# Main Nutrition Retrieval for a Single Product
+# Unified pipeline
 # ----------------------------------------------------------------------
 def get_product_nutrition(product_name: str) -> Optional[Dict]:
-    """
-    Combined pipeline:
-    1. Try Open Food Facts (primary).
-    2. If not found, fallback to OpenAI.
-    Returns a dictionary of nutrients per 100g/ml, or None.
-    """
-    nutrients = get_nutrition_openfoodfacts(product_name)
+    # 1. USDA
+    nutrients = get_nutrition_usda(product_name)
     if nutrients:
-        logging.info(f"Found in Open Food Facts: {product_name}")
         return nutrients
 
-    logging.info(f"Falling back to OpenAI for: {product_name}")
-    return get_nutrition_openai(product_name)
+    # 2. Open Food Facts
+    nutrients = get_nutrition_openfoodfacts(product_name)
+    if nutrients:
+        return nutrients
 
+    # 3. API Ninjas
+    nutrients = get_nutrition_ninjas(product_name)
+    if nutrients:
+        return nutrients
+
+    # 4. Google Gemini
+    nutrients = get_nutrition_gemini(product_name)
+    if nutrients:
+        return nutrients
+
+    # 5. Local Ollama
+    nutrients = get_nutrition_ollama(product_name)
+    if nutrients:
+        return nutrients
+
+    logging.warning(f"No source found data for '{product_name}'.")
+    return None
 
 # ----------------------------------------------------------------------
-# Aggregation Across a Full Receipt
+# Scaling and Totals
 # ----------------------------------------------------------------------
 def scale_nutrients(nutrients: Dict, quantity: float, unit: str) -> Dict[str, float]:
-    """
-    Convert nutrient values (per 100g or per 100ml) to actual amounts
-    based on the quantity and unit.
-
-    For solid items: assumes 'g', 'kg' → scale to grams.
-    For liquids: assumes 'ml', 'l' → scale to millilitres.
-    For 'piece': we assume an average weight of 100g (can be customised).
-    """
-    # Conversion factors to grams or millilitres
     if unit in ("g", "ml"):
         factor = quantity / 100.0
-    elif unit in ("kg",):
+    elif unit == "kg":
         factor = quantity * 1000 / 100.0
-    elif unit in ("l",):
+    elif unit == "l":
         factor = quantity * 1000 / 100.0
-    elif unit in ("oz",):
+    elif unit == "oz":
         factor = quantity * 28.3495 / 100.0
-    elif unit in ("lb",):
+    elif unit == "lb":
         factor = quantity * 453.592 / 100.0
     elif unit == "piece":
         factor = quantity  # assume 100g per piece
     else:
-        factor = quantity / 100.0  # fallback
+        factor = quantity / 100.0
 
     scaled = {}
     for k, v in nutrients.items():
         if isinstance(v, (int, float)):
             scaled[k] = v * factor
         else:
-            scaled[k] = v  # keep non-numeric fields unchanged
+            scaled[k] = v
     return scaled
-
 
 def calculate_total_nutrition(
     receipt_lines: List[str],
     abbreviations: Optional[Dict[str, str]] = None,
 ) -> Dict:
-    """
-    Main entry point: given a list of raw receipt lines,
-    return:
-        - items: list of per-item details (name, quantity, unit, nutrients, scaled_nutrients)
-        - totals: total nutritional values across all items
-        - warnings: list of items that could not be found
-    """
     if abbreviations is None:
         abbreviations = load_abbreviations()
 
@@ -395,17 +524,14 @@ def calculate_total_nutrition(
         if not product_raw:
             continue
 
-        # Expand abbreviations
         product_expanded = expand_abbreviations(product_raw, abbreviations)
         logging.info(f"Processing: '{product_expanded}' (from '{product_raw}')")
 
-        # Get per-100g nutrients
         nutrients_per100 = get_product_nutrition(product_expanded)
 
         scaled = None
         if nutrients_per100 and parsed["quantity"] is not None and parsed["unit"] is not None:
             scaled = scale_nutrients(nutrients_per100, parsed["quantity"], parsed["unit"])
-            # Accumulate totals (map keys to standard names)
             total_nutrients["energy-kcal"] += scaled.get("energy-kcal_100g", 0)
             total_nutrients["fat_g"] += scaled.get("fat_100g", 0)
             total_nutrients["saturated-fat_g"] += scaled.get("saturated-fat_100g", 0)
@@ -415,7 +541,6 @@ def calculate_total_nutrition(
             total_nutrients["proteins_g"] += scaled.get("proteins_100g", 0)
             total_nutrients["salt_g"] += scaled.get("salt_100g", 0)
         elif nutrients_per100:
-            # No quantity found; just record per-100g values, no totals
             scaled = nutrients_per100
             warnings.append(
                 f"No quantity for '{product_expanded}' – using per 100g/ml values without scaling."
@@ -423,35 +548,22 @@ def calculate_total_nutrition(
         else:
             warnings.append(f"No nutritional data found for '{product_expanded}'.")
 
-        items.append(
-            {
-                "raw": parsed["raw"],
-                "product_original": product_raw,
-                "product_expanded": product_expanded,
-                "quantity": parsed["quantity"],
-                "unit": parsed["unit"],
-                "nutrients_per100": nutrients_per100,
-                "scaled_nutrients": scaled,
-            }
-        )
+        items.append({
+            "raw": parsed["raw"],
+            "product_original": product_raw,
+            "product_expanded": product_expanded,
+            "quantity": parsed["quantity"],
+            "unit": parsed["unit"],
+            "nutrients_per100": nutrients_per100,
+            "scaled_nutrients": scaled,
+        })
 
     return {"items": items, "totals": total_nutrients, "warnings": warnings}
 
-
 # ----------------------------------------------------------------------
-# Example usage (can be tested standalone)
+# Example run
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-
-    path = "data/abbreviations.json"
-    print("Looking for:", os.path.abspath(path))
-    print("Exists:", os.path.exists(path))
-    if os.path.exists(path):
-        with open(path, "rb") as f:
-            raw = f.read()[:100]
-            print("First 100 bytes (repr):", repr(raw))
-            
-    # Sample receipt text (extracted by OCR)
     sample_lines = [
         "CHK BRST 1.5KG @ 45.00",
         "WHL WHT BREAD 1PC @ 5.50",
@@ -459,7 +571,9 @@ if __name__ == "__main__":
     ]
 
     result = calculate_total_nutrition(sample_lines)
-
-    print(json.dumps(result["totals"], indent=2))
-    for warn in result["warnings"]:
-        print(f"WARNING: {warn}")
+    print("\n===== NUTRITION TOTALS =====")
+    for k, v in result["totals"].items():
+        print(f"{k}: {v:.2f}")
+    print("\nWarnings:")
+    for w in result["warnings"]:
+        print(f" - {w}")
