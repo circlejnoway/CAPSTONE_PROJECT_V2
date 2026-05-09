@@ -16,6 +16,8 @@ import cv2
 
 # Language settings
 OCR_LANG = "eng"          # Language for Tesseract ('eng', 'eng+ara', etc.)
+OCR_ENGINE = "easyocr"  # OCR engine: 'tesseract' or 'easyocr'
+USE_EASYOCR = False       # Set to True for better accuracy (slower but more accurate)
 
 # Image processing parameters
 MIN_IMAGE_WIDTH = 1200    # Minimum width for optimal Tesseract performance

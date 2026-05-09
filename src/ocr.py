@@ -239,11 +239,17 @@ def binarize_receipt(gray_image: np.ndarray) -> np.ndarray:
     return binary
 
 
-def denoise_and_morphology(binary_image: np.ndarray) -> np.ndarray:
-    """Use erosion/dilation and morphological opening/closing to clean the receipt text."""
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    cleaned = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernel, iterations=1)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=1)
+def denoise_and_morphology(binary_image: np.ndarray, aggressive: bool = False) -> np.ndarray:
+    """Use light morphological operations to clean text without over-thickening."""
+    if aggressive:
+        # More aggressive cleaning for noisy images
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        cleaned = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernel, iterations=1)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=1)
+    else:
+        # Light cleaning - opening only to remove small noise
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        cleaned = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernel, iterations=1)
     return cleaned
 
 
@@ -260,7 +266,7 @@ def preprocess_receipt(image: np.ndarray, debug: bool = False, aggressive: bool 
     receipt_region = receipt_region if receipt_region is not None else cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
 
     binary = binarize_receipt(receipt_region)
-    cleaned = denoise_and_morphology(binary)
+    cleaned = denoise_and_morphology(binary, aggressive=aggressive)
 
     if debug:
         logger.info("Preprocessing complete: grayscale, thresholding, morphology applied.")
@@ -542,21 +548,10 @@ def extract_text_with_confidence(image: np.ndarray, lang: str = OCR_LANG) -> Tup
     
     return text, metrics
 
-def extract_text(image: np.ndarray, lang: str = OCR_LANG) -> str:
-    """
-    Extract text from preprocessed receipt image using optimized Tesseract configuration.
-    Uses multiple strategies with fallback options.
-    """
-    h, w = image.shape[:2]
-    logger.info(f"Processing image size: {w}x{h}")
-    
+def extract_text_tesseract(image: np.ndarray, lang: str = OCR_LANG) -> str:
+    """Extract text using Tesseract with receipt-optimized PSM modes."""
     pil_img = Image.fromarray(image)
-    
-    # Try receipt-friendly page segmentation modes first.
-    # PSM 4 assumes a single column of variable-sized text.
-    # PSM 6 assumes a single uniform block of text.
     psm_modes = ["4", "6", "3"]
-
     best_text = ""
     best_length = 0
 
@@ -564,21 +559,67 @@ def extract_text(image: np.ndarray, lang: str = OCR_LANG) -> str:
         try:
             config = f"--oem 3 --psm {psm}"
             text = pytesseract.image_to_string(pil_img, lang=lang, config=config).strip()
-
             alpha_count = len(re.sub(r'[^a-zA-Z]', '', text))
-            logger.debug(f"PSM {psm}: {alpha_count} letters, {len(text)} chars")
-
+            logger.debug(f"Tesseract PSM {psm}: {alpha_count} letters, {len(text)} chars")
             if alpha_count > best_length:
                 best_text = text
                 best_length = alpha_count
                 if alpha_count > 50:
-                    logger.debug(f"Good result with PSM {psm}")
+                    logger.debug(f"Good result with Tesseract PSM {psm}")
                     break
         except Exception as e:
-            logger.warning(f"PSM {psm} failed: {e}")
-            continue
-
+            logger.warning(f"Tesseract PSM {psm} failed: {e}")
     return best_text
+
+
+def extract_text_easyocr(image: np.ndarray, lang: str = "en") -> str:
+    """Extract text using EasyOCR (better accuracy, slower than Tesseract)."""
+    try:
+        import easyocr
+        reader = easyocr.Reader([lang], gpu=False)
+        result = reader.readtext(image, detail=0)
+        text = "\n".join(result)
+        logger.info(f"EasyOCR extracted {len(result)} text regions")
+        return text
+    except ImportError:
+        logger.warning("EasyOCR not installed, falling back to Tesseract")
+        return extract_text_tesseract(image, lang=OCR_LANG)
+    except Exception as e:
+        logger.error(f"EasyOCR failed: {e}, falling back to Tesseract")
+        return extract_text_tesseract(image, lang=OCR_LANG)
+
+
+def extract_text(image: np.ndarray, lang: str = OCR_LANG, engine: str = None) -> str:
+    """
+    Extract text from preprocessed receipt image using configured OCR engine.
+    Supports both Tesseract and EasyOCR with automatic fallback.
+    
+    Parameters:
+    -----------
+    image : np.ndarray
+        Preprocessed binary/grayscale image
+    lang : str
+        Language code ('eng', 'eng+ara', etc.)
+    engine : str
+        OCR engine ('tesseract' or 'easyocr'), uses config if None
+        
+    Returns:
+    --------
+    str
+        Extracted text from receipt image
+    """
+    h, w = image.shape[:2]
+    logger.info(f"Processing image size: {w}x{h}")
+    
+    if engine is None:
+        engine = getattr(globals().get("OCR_ENGINE", "tesseract"), "lower", lambda: "tesseract")()
+    
+    if engine.lower() == "easyocr":
+        logger.info("Using EasyOCR engine")
+        return extract_text_easyocr(image, lang=lang.split("+")[0].lower())
+    else:
+        logger.info("Using Tesseract engine")
+        return extract_text_tesseract(image, lang=lang)
 
 # Receipt entity parsing
 DATE_PATTERNS = [
