@@ -26,22 +26,17 @@ This guide explains how to train a custom OCR model using the **SROIE dataset** 
    unzip sroie-datasetv2.zip -d data/sroie/
    ```
 
-### Expected Directory Structure
-```
-data/sroie/
-├── images/              # Receipt images
-│   ├── 0001.jpg
-│   ├── 0002.jpg
-│   └── ... (600+ images)
-├── annotations/         # Full text per receipt
-│   ├── 0001.txt
-│   ├── 0002.txt
-│   └── ...
-└── box_labels/         # Bounding boxes per text region
-    ├── 0001.txt
-    ├── 0002.txt
-    └── ...
-```
+###  Directory Structure
+
+SROIE2019/
+├── train/
+│   ├── img/         # 626 receipt images (.jpg)
+│   ├── box/         # 626 bounding box annotation files (.txt)
+│   └── entities/    # 626 key-entity JSON files (.txt)
+└── test/
+    ├── img/         # 347 receipt images (.jpg)
+    ├── box/         # 347 bounding box annotation files (.txt)
+    └── entities/    # 347 key-entity JSON files (.txt)
 
 ---
 
@@ -86,7 +81,7 @@ conda activate env_capstone_v2
 
 # Train PaddleOCR model
 python src/train_ocr.py \
-    --dataset_dir data/sroie/ \
+    --dataset_dir data/sroie/SROIE2019/ \
     --output_dir models/receipt_ocr/ \
     --engine paddle \
     --epochs 50 \
