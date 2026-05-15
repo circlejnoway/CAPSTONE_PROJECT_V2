@@ -10,7 +10,7 @@ SROIE Dataset: https://www.kaggle.com/datasets/urbikn/sroie-datasetv2
 
 This module supports:
 1. EasyOCR fine-tuning (recommended - easier setup)
-2. PaddleOCR training (more advanced, better for production)
+2. PaddleOCR training (more advanced, better for production - requires source installation)
 3. Custom Tesseract model training (complex, requires tesstrain)
 
 Setup Instructions:
@@ -21,7 +21,11 @@ Setup Instructions:
    - Extract to: data/sroie/
 
 2. Install training dependencies:
-   pip install paddleocr paddlepaddle opencv-python pillow
+   pip install paddleocr paddlepaddle easyocr
+   
+   For full PaddleOCR training (optional):
+   git clone https://github.com/PaddlePaddle/PaddleOCR.git
+   cd PaddleOCR && pip install -r requirements.txt
 
 3. Run training:
    python src/train_ocr.py --dataset_dir data/sroie/ --output_dir models/receipt_ocr/ --epochs 50
@@ -38,6 +42,7 @@ from typing import Dict, List, Tuple, Optional
 import argparse
 import shutil
 import zipfile
+import yaml
 
 import cv2
 import numpy as np
@@ -73,24 +78,24 @@ class SROIEDataset:
         Initialize SROIE dataset.
         
         Expected structure:
-        data/sroie/
-        ├── images/
-        │   ├── 0001.jpg
-        │   ├── 0002.jpg
+        data/sroie/SROIE2019/train/
+        ├── img/
+        │   ├── X00016469612.jpg
+        │   ├── X00016469619.jpg
         │   └── ...
-        ├── annotations/
-        │   ├── 0001.txt
-        │   ├── 0002.txt
+        ├── entities/
+        │   ├── X00016469612.txt (JSON format)
+        │   ├── X00016469619.txt
         │   └── ...
-        └── box_labels/
-            ├── 0001.txt
-            ├── 0002.txt
+        └── box/
+            ├── X00016469612.txt (bounding box format)
+            ├── X00016469619.txt
             └── ...
         """
         self.dataset_dir = Path(dataset_dir)
-        self.images_dir = self.dataset_dir / "images"
-        self.annot_dir = self.dataset_dir / "annotations"
-        self.box_dir = self.dataset_dir / "box_labels"
+        self.images_dir = self.dataset_dir / "SROIE2019" / "train" / "img"
+        self.annot_dir = self.dataset_dir / "SROIE2019" / "train" / "entities"
+        self.box_dir = self.dataset_dir / "SROIE2019" / "train" / "box"
         
         if not self.images_dir.exists():
             raise FileNotFoundError(f"Images directory not found: {self.images_dir}")
@@ -99,14 +104,14 @@ class SROIEDataset:
                                   list(self.images_dir.glob("*.png")))
         logger.info(f"Found {len(self.image_files)} receipt images")
     
-    def get_annotations(self, image_file: Path) -> str:
-        """Get full OCR text annotation for an image."""
+    def get_annotations(self, image_file: Path) -> Dict:
+        """Get entity annotations for an image (JSON format)."""
         stem = image_file.stem
         annot_file = self.annot_dir / f"{stem}.txt"
         if annot_file.exists():
             with open(annot_file, "r", encoding="utf-8") as f:
-                return f.read().strip()
-        return ""
+                return json.load(f)
+        return {}
     
     def get_boxes_and_text(self, image_file: Path) -> List[Dict]:
         """Get bounding boxes and text for each region."""
@@ -176,15 +181,28 @@ class PaddleOCRTrainer:
         val_gt = []
         
         for img_file in train_files:
-            text = dataset.get_annotations(img_file)
-            if text:
-                # PaddleOCR format: image_path\ttext
-                train_gt.append(f"{img_file.absolute()}\t{text}")
+            annotations = dataset.get_annotations(img_file)
+            if annotations:
+                # Combine all entity text for PaddleOCR training
+                text_parts = []
+                for key, value in annotations.items():
+                    if isinstance(value, str) and value.strip():
+                        text_parts.append(value.strip())
+                combined_text = " ".join(text_parts)
+                if combined_text:
+                    # PaddleOCR format: image_path\ttext
+                    train_gt.append(f"{img_file.absolute()}\t{combined_text}")
         
         for img_file in test_files:
-            text = dataset.get_annotations(img_file)
-            if text:
-                val_gt.append(f"{img_file.absolute()}\t{text}")
+            annotations = dataset.get_annotations(img_file)
+            if annotations:
+                text_parts = []
+                for key, value in annotations.items():
+                    if isinstance(value, str) and value.strip():
+                        text_parts.append(value.strip())
+                combined_text = " ".join(text_parts)
+                if combined_text:
+                    val_gt.append(f"{img_file.absolute()}\t{combined_text}")
         
         # Write to files
         train_gt_path = output_dir / "train_gt.txt"
@@ -208,9 +226,6 @@ class PaddleOCRTrainer:
         logger.info("Note: First run downloads pre-trained model (~100MB)")
         
         try:
-            from paddleocr import PaddleOCR
-            from paddleocr.tools.train import main as paddle_train
-            
             # Create config for training
             config = {
                 "Global": {
@@ -231,12 +246,12 @@ class PaddleOCRTrainer:
             
             config_path = self.model_dir / "config.yml"
             with open(config_path, "w") as f:
-                import yaml
                 yaml.dump(config, f)
             
             logger.info(f"Training config saved to {config_path}")
             logger.info("For full PaddleOCR training, use the official training script:")
             logger.info(f"  python -m paddle.distributed.launch --gpus=0 tools/train.py -c {config_path}")
+            logger.info("Note: This requires PaddleOCR source code installation, not just pip install")
             
         except Exception as e:
             logger.error(f"PaddleOCR training setup failed: {e}")
