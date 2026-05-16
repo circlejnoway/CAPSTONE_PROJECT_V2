@@ -1,0 +1,23 @@
+[project]
+name = "capstone_project_v2"
+version = "0.1.0"
+description = "Receipt OCR and nutrition analysis capstone project"
+requires-python = ">=3.10"
+dependencies = [
+  "paddleocr",
+  "opencv-python",
+  "numpy",
+  "pandas",
+  "scikit-learn",
+  "pyyaml",
+  "pillow",
+  "requests",
+  "python-dotenv",
+  "rapidfuzz",
+  "openai",
+  "openfoodfacts",
+  "streamlit",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

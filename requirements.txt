@@ -1,0 +1,13 @@
+paddleocr
+opencv-python
+numpy
+pandas
+scikit-learn
+pyyaml
+pillow
+requests
+python-dotenv
+rapidfuzz
+openai
+openfoodfacts
+streamlit

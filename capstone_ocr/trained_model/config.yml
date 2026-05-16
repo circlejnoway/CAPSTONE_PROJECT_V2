@@ -1,0 +1,110 @@
+Architecture:
+  Backbone:
+    model_name: small
+    name: MobileNetV3
+    scale: 0.5
+    small_stride:
+    - 1
+    - 2
+    - 2
+    - 2
+  Head:
+    fc_decay: 1.0e-05
+    name: CTCHead
+  Neck:
+    encoder_type: rnn
+    hidden_size: 48
+    name: SequenceEncoder
+  Transform: null
+  algorithm: CRNN
+  model_type: rec
+Eval:
+  dataset:
+    data_dir: /content/receipt_ocr_data/crops/
+    label_file_list:
+    - /content/receipt_ocr_data/val_gt.txt
+    name: SimpleDataSet
+    transforms:
+    - DecodeImage:
+        channel_first: false
+        img_mode: BGR
+    - CTCLabelEncode: null
+    - RecResizeImg:
+        image_shape:
+        - 3
+        - 32
+        - 320
+    - KeepKeys:
+        keep_keys:
+        - image
+        - label
+        - length
+  loader:
+    batch_size_per_card: 16
+    drop_last: false
+    num_workers: 0
+    shuffle: false
+Global:
+  cal_metric_during_train: true
+  character_dict_path: /content/receipt_ocr_data/ppocr_keys_v1.txt
+  checkpoints: /content/output/rec/receipt_ocr/latest
+  distributed: false
+  epoch_num: 5
+  eval_batch_step:
+  - 0
+  - 100
+  infer_mode: false
+  log_smooth_window: 20
+  max_text_length: 25
+  pretrained_model: null
+  print_batch_step: 10
+  save_epoch_step: 1
+  save_model_dir: /content/output/rec/receipt_ocr/
+  use_gpu: false
+  use_space_char: true
+Loss:
+  name: CTCLoss
+Metric:
+  main_indicator: acc
+  name: RecMetric
+Optimizer:
+  beta1: 0.9
+  beta2: 0.999
+  lr:
+    learning_rate: 0.001
+    name: Cosine
+    warmup_epoch: 5
+  name: Adam
+  regularizer:
+    factor: 3.0e-05
+    name: L2
+PostProcess:
+  name: CTCLabelDecode
+Train:
+  dataset:
+    data_dir: /content/receipt_ocr_data/crops/
+    label_file_list:
+    - /content/receipt_ocr_data/train_gt.txt
+    name: SimpleDataSet
+    transforms:
+    - DecodeImage:
+        channel_first: false
+        img_mode: BGR
+    - RecAug: null
+    - CTCLabelEncode: null
+    - RecResizeImg:
+        image_shape:
+        - 3
+        - 32
+        - 320
+    - KeepKeys:
+        keep_keys:
+        - image
+        - label
+        - length
+  loader:
+    batch_size_per_card: 16
+    drop_last: true
+    num_workers: 0
+    shuffle: true
+profiler_options: null

@@ -1,0 +1,10 @@
+app:
+  title: "CAPSTONE Receipt Nutrition Analyzer"
+  version: "0.1.0"
+ocr:
+  raw_receipts_dir: "data/receipts/raw"
+  preprocessed_dir: "data/receipts/preprocessed"
+  output_dir: "data/ocr_output"
+api:
+  timeout_seconds: 10
+  retry_attempts: 2
