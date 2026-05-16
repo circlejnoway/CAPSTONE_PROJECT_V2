@@ -1,13 +1,15 @@
-﻿# Data and models
-data/
-models/
-*.zip
-receipt_ocr_data*/
-PaddleOCR/
-
-# Python cache
-__pycache__/
+.env
+.env.local
 *.pyc
-*.pyo
+__pycache__/
 *.egg-info/
 .DS_Store
+.vscode/
+models/
+data/
+*.zip
+PaddleOCR/
+receipt_ocr_data*/
+venv/
+env/
+.conda/

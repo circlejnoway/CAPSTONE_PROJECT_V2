@@ -1,0 +1,16 @@
+name: capstone-ocr
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - paddleocr
+    - opencv-python
+    - numpy
+    - pandas
+    - scikit-learn
+    - pillow
+    - requests
+    - python-dotenv
